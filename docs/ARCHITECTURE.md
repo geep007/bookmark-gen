@@ -419,7 +419,13 @@ Each epic builds on previous work, enabling incremental validation.
 - ⏳ Story 1.6: Health check API (completed)
 
 ### Epic 2: Intelligence Layer & Enrichment
-- All stories pending implementation
+- ✅ Story 2.1: LLM Client Configuration & Model Routing (completed)
+- ✅ Story 2.2: Intent & Reason Enrichment (completed)
+- ✅ Story 2.3: Context Extraction & Author Analysis (completed)
+- ✅ Story 2.4: Category Assignment & Classification (completed)
+- ✅ Story 2.5: Connection Detection Between Bookmarks (completed)
+- ✅ Story 2.6: Batch Enrichment Pipeline & Progress Tracking (completed)
+- ✅ Story 2.7: Enrichment Quality Dashboard & Cost Tracking API (completed)
 
 ### Epic 3: Query & Retrieval System
 - All stories pending implementation

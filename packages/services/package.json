@@ -10,7 +10,9 @@
   "dependencies": {
     "@bookmark-gen/database": "*",
     "@bookmark-gen/shared": "*",
-    "@modelcontextprotocol/sdk": "^1.22.0"
+    "@modelcontextprotocol/sdk": "^1.22.0",
+    "openai": "^4.75.0",
+    "@anthropic-ai/sdk": "^0.33.0"
   },
   "devDependencies": {
     "typescript": "^5.3.3"

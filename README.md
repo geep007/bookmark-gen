@@ -94,10 +94,17 @@ bookmark-gen/
 
 ### Enriching Bookmarks
 
+#### Via UI (Coming in Epic 4)
 1. Click "Enrich Bookmarks" button
 2. Review estimated cost and time
 3. Confirm to start batch enrichment
 4. Monitor progress and quality metrics
+
+#### Via API (Available Now)
+- `POST /api/enrich/batch` - Start batch enrichment
+- `GET /api/enrich/batch` - Get cost estimate
+- `GET /api/enrich/status` - Check enrichment status
+- `GET /api/enrichment/metrics` - View cost and quality metrics
 
 ### Querying Bookmarks
 
@@ -112,11 +119,17 @@ bookmark-gen/
 ## Development Roadmap
 
 ### MVP (Current)
-- ✅ Project initialization and setup
-- 🚧 MCP integration (Twitter + LinkedIn)
-- 🚧 Multi-model LLM enrichment pipeline
-- 🚧 Query and retrieval system
-- 🚧 Dashboard and user interface
+- ✅ Project initialization and setup (Epic 1)
+- ✅ Multi-model LLM enrichment pipeline (Epic 2)
+  - ✅ LLM client with OpenAI & Anthropic support
+  - ✅ Intent & reason generation
+  - ✅ Context extraction & author analysis
+  - ✅ Auto-categorization (Inspo/Leads/Tutorials)
+  - ✅ Connection detection between bookmarks
+  - ✅ Batch enrichment with cost tracking
+- 🚧 MCP integration (Twitter + LinkedIn - Epic 1 ongoing)
+- 🚧 Query and retrieval system (Epic 3)
+- 🚧 Dashboard and user interface (Epic 4)
 
 ### Phase 2 (Future)
 - Eagle visual bookmark integration
