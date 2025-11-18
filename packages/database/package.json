@@ -1,0 +1,20 @@
+{
+  "name": "@bookmark-gen/database",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "setup": "node scripts/setup.js",
+    "migrate": "node scripts/migrate.js",
+    "seed": "node scripts/seed.js",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.2.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "typescript": "^5.3.3"
+  }
+}
