@@ -165,3 +165,16 @@ export interface HunterInsight {
   outreach_suggestions: string[];
   bookmarks: Bookmark[];
 }
+
+// Sync history tracking
+export interface SyncHistory {
+  id: string;
+  source: BookmarkSource;
+  timestamp: Date;
+  total_fetched: number;
+  new_inserts: number;
+  duplicates_skipped: number;
+  errors: number;
+  error_details?: string[] | null;
+  status: 'completed' | 'failed' | 'partial';
+}

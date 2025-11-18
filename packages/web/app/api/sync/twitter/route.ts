@@ -4,24 +4,38 @@
  */
 
 import { NextResponse } from 'next/server';
+import { BookmarkSyncService } from '@bookmark-gen/services';
 
 export async function POST() {
   try {
-    // TODO: Implement Twitter MCP integration
-    // This is a placeholder for Epic 1, Story 1.3
+    const syncService = new BookmarkSyncService();
+
+    console.log('Starting Twitter bookmark sync...');
+
+    // Perform sync with progress logging
+    const summary = await syncService.syncTwitter((progress) => {
+      console.log(`Twitter sync: ${progress.message}`);
+    });
+
+    console.log('Twitter sync completed:', summary);
+
+    // Return sync summary
+    return NextResponse.json(
+      {
+        data: summary,
+        metadata: {
+          timestamp: new Date().toISOString(),
+        },
+      },
+      { status: 200 }
+    );
+  } catch (error) {
+    console.error('Twitter sync error:', error);
 
     return NextResponse.json(
       {
-        message: 'Twitter sync not yet implemented',
-        status: 'pending',
-        epic: 'Epic 1, Story 1.3',
-      },
-      { status: 501 } // Not Implemented
-    );
-  } catch (error) {
-    return NextResponse.json(
-      {
         error: error instanceof Error ? error.message : 'Twitter sync failed',
+        code: 'TWITTER_SYNC_ERROR',
       },
       { status: 500 }
     );

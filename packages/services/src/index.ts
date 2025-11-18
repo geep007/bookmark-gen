@@ -4,9 +4,8 @@
 
 export * from './config';
 
-// MCP services (to be implemented in Epic 1)
-// export * from './mcp/twitter';
-// export * from './mcp/linkedin';
+// MCP services (Epic 1: Stories 1.3 and 1.4)
+export * from './mcp';
 
 // Enrichment services (to be implemented in Epic 2)
 // export * from './enrichment/llm-client';
