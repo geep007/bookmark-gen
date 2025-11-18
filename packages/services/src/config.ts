@@ -69,3 +69,15 @@ export function isMCPAvailable(source: 'twitter' | 'linkedin'): boolean {
     ? !!config.mcp.twitter_token
     : !!config.mcp.linkedin_token;
 }
+
+/**
+ * Get current configuration (singleton pattern)
+ */
+let configInstance: AppConfig | null = null;
+
+export function getConfig(): AppConfig {
+  if (!configInstance) {
+    configInstance = loadConfig();
+  }
+  return configInstance;
+}

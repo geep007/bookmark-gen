@@ -8,8 +8,9 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "@bookmark-gen/database": "*",
     "@bookmark-gen/shared": "*",
-    "@bookmark-gen/database": "*"
+    "@modelcontextprotocol/sdk": "^1.22.0"
   },
   "devDependencies": {
     "typescript": "^5.3.3"

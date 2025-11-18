@@ -4,35 +4,32 @@
  */
 
 import { NextResponse } from 'next/server';
-import { BookmarkRepository } from '@database/repositories/bookmarks';
+import { BookmarkSyncService } from '@bookmark-gen/services';
 
 export async function GET() {
   try {
-    const bookmarkRepo = new BookmarkRepository();
-    const counts = bookmarkRepo.countBySource();
+    const syncService = new BookmarkSyncService();
 
-    // TODO: Add sync history retrieval when sync_history table is used
+    // Get sync status for each source
+    const twitterStatus = syncService.getSyncStatus('twitter');
+    const linkedinStatus = syncService.getSyncStatus('linkedin');
+    const eagleStatus = syncService.getSyncStatus('eagle');
+
     return NextResponse.json({
-      twitter: {
-        total_bookmarks: counts.twitter,
-        last_sync_time: null, // To be implemented with sync history
-        last_sync_summary: null,
+      data: {
+        twitter: twitterStatus,
+        linkedin: linkedinStatus,
+        eagle: eagleStatus,
       },
-      linkedin: {
-        total_bookmarks: counts.linkedin,
-        last_sync_time: null,
-        last_sync_summary: null,
-      },
-      eagle: {
-        total_bookmarks: counts.eagle,
-        last_sync_time: null,
-        last_sync_summary: null,
+      metadata: {
+        timestamp: new Date().toISOString(),
       },
     });
   } catch (error) {
     return NextResponse.json(
       {
         error: error instanceof Error ? error.message : 'Failed to get sync status',
+        code: 'SYNC_STATUS_ERROR',
       },
       { status: 500 }
     );
