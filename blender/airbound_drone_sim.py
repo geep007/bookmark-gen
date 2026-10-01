@@ -1,0 +1,717 @@
+"""
+Airbound tailsitter delivery drone -- real-world delivery simulation for Blender.
+
+Imports the drone model generated in FLORA (GLB) and builds a full, keyframed
+delivery mission in a procedural city:
+
+    1. Idle on the hub rooftop, props spin up
+    2. Vertical take-off (tailsitter, nose up)
+    3. Transition: pitches over from hover into wing-borne forward flight
+    4. Cruise along a curved route with coordinated-turn banking
+    5. Back-transition to hover over the drop zone, descend
+    6. Winch lowers the parcel on a tether (pendulum swing), release, retract
+    7. Climb, transition again and depart
+
+The motion is computed with a small kinematic flight model (speed profile,
+coordinated-turn bank = atan(v^2 * curvature / g), gust noise in hover,
+damped pendulum for the tethered parcel) and baked to keyframes, so the
+result plays back in real time and can be edited like any animation.
+
+Usage
+-----
+Blender GUI: open the Scripting workspace, load this file, set GLB_PATH below
+(or leave it empty to get a stand-in drone), press Run Script.
+
+Command line:
+    blender --background --python airbound_drone_sim.py -- \
+        --glb /path/to/drone.glb [--render /path/out.mp4] [--blend /path/scene.blend]
+
+Tested with Blender 4.2+ (bpy module).
+"""
+
+import math
+import os
+import random
+import sys
+
+import bpy
+from mathutils import Euler, Matrix, Vector, noise
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+GLB_PATH = ""                # FLORA export, e.g. "~/Downloads/drone.glb"
+WINGSPAN_M = 1.6             # real-world span the model is scaled to
+MODEL_ROTATION_DEG = (0, 0, 0)  # extra XYZ rotation if the GLB imports facing the wrong way
+# After correction the drone must face +Y (nose), wings along X, top along +Z.
+
+FPS = 24
+CRUISE_ALT_M = 60.0          # above ground
+CRUISE_SPEED_MS = 22.0       # ~80 km/h
+HUB_HEIGHT_M = 12.0          # rooftop pad height at the hub
+HOVER_DROP_ALT_M = 18.0      # hover height above the drop zone while winching
+ROUTE_END = Vector((620.0, 260.0))  # drop zone, metres from the hub
+ROUTE_BEND = 140.0           # lateral offset of the route curve (gives a banked turn)
+G = 9.81
+
+# phase durations (seconds)
+T_IDLE = 2.0
+T_CLIMB = 6.0
+T_TRANSITION = 4.0
+T_DESCEND = 5.0
+T_LOWER = 6.0
+T_RELEASE = 1.0
+T_RETRACT = 3.0
+T_DEPART_CLIMB = 4.0
+T_DEPART = 6.0
+
+PROP_RPM = 4200
+SEED = 7
+
+
+def parse_cli():
+    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    opts = {"glb": GLB_PATH, "render": "", "blend": "", "stills": "", "engine": ""}
+    i = 0
+    while i < len(argv):
+        key = argv[i].lstrip("-")
+        if key in opts and i + 1 < len(argv):
+            opts[key] = argv[i + 1]
+            i += 2
+        else:
+            i += 1
+    return opts
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def smoothstep(x):
+    x = max(0.0, min(1.0, x))
+    return x * x * (3 - 2 * x)
+
+
+def material(name, color, rough=0.6, metal=0.0, emit=None, alpha=1.0):
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    bsdf.inputs["Base Color"].default_value = (*color, 1.0)
+    bsdf.inputs["Roughness"].default_value = rough
+    bsdf.inputs["Metallic"].default_value = metal
+    if emit:
+        sock = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
+        sock.default_value = (*emit, 1.0)
+        bsdf.inputs["Emission Strength"].default_value = 4.0
+    if alpha < 1.0:
+        bsdf.inputs["Alpha"].default_value = alpha
+        if hasattr(mat, "surface_render_method"):
+            mat.surface_render_method = "BLENDED"
+        elif hasattr(mat, "blend_method"):
+            mat.blend_method = "BLEND"
+    return mat
+
+
+def add_box(name, size, loc, mat):
+    bpy.ops.mesh.primitive_cube_add(size=1, location=loc)
+    ob = bpy.context.active_object
+    ob.name = name
+    ob.scale = size
+    bpy.ops.object.transform_apply(scale=True)
+    ob.data.materials.append(mat)
+    return ob
+
+
+def reset_scene():
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    scene = bpy.context.scene
+    scene.render.fps = FPS
+    scene.unit_settings.system = "METRIC"
+    return scene
+
+
+# --------------------------------------------------------------------------
+# Drone
+# --------------------------------------------------------------------------
+
+def build_standin_drone(mat):
+    """Blended-wing-body tailsitter built from primitives (used when no GLB)."""
+    parts = []
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, location=(0, 0, 0))
+    body = bpy.context.active_object
+    body.scale = (0.32, 0.9, 0.22)
+    parts.append(body)
+    for side in (-1, 1):
+        bpy.ops.mesh.primitive_cube_add(size=1, location=(side * 0.55, -0.05, -0.02))
+        wing = bpy.context.active_object
+        wing.scale = (0.85, 0.32, 0.03)
+        wing.rotation_euler = (0, side * math.radians(-8), side * math.radians(-18))
+        parts.append(wing)
+        bpy.ops.mesh.primitive_cube_add(size=1, location=(side * 0.12, -0.25, -0.18))
+        fin = bpy.context.active_object
+        fin.scale = (0.02, 0.28, 0.2)
+        parts.append(fin)
+        bpy.ops.mesh.primitive_cylinder_add(radius=0.025, depth=0.14,
+                                            location=(side * 0.42, 0.2, 0.08))
+        parts.append(bpy.context.active_object)
+    for p in parts:
+        p.data.materials.append(mat)
+    bpy.ops.object.select_all(action="DESELECT")
+    for p in parts:
+        p.select_set(True)
+    bpy.context.view_layer.objects.active = body
+    bpy.ops.object.join()
+    body.name = "Drone_Model"
+    return body
+
+
+def import_drone(glb_path, mat_fallback):
+    if glb_path and os.path.exists(os.path.expanduser(glb_path)):
+        before = set(bpy.data.objects)
+        bpy.ops.import_scene.gltf(filepath=os.path.expanduser(glb_path))
+        new = [o for o in bpy.data.objects if o not in before]
+        meshes = [o for o in new if o.type == "MESH"]
+        bpy.ops.object.select_all(action="DESELECT")
+        for o in meshes:
+            o.select_set(True)
+        bpy.context.view_layer.objects.active = meshes[0]
+        bpy.ops.object.parent_clear(type="CLEAR_KEEP_TRANSFORM")
+        if len(meshes) > 1:
+            bpy.ops.object.join()
+        model = bpy.context.active_object
+        for o in new:
+            if o.name in bpy.data.objects and o is not model and o.type != "MESH":
+                bpy.data.objects.remove(o, do_unlink=True)
+        model.name = "Drone_Model"
+        print(f"[airbound] imported {glb_path}")
+    else:
+        if glb_path:
+            print(f"[airbound] GLB not found at {glb_path}; using stand-in drone")
+        model = build_standin_drone(mat_fallback)
+
+    # user orientation correction
+    model.rotation_euler = Euler([math.radians(a) for a in MODEL_ROTATION_DEG])
+    bpy.ops.object.select_all(action="DESELECT")
+    model.select_set(True)
+    bpy.context.view_layer.objects.active = model
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+
+    # wings must lie along X: if the model is wider along Y, turn it 90 degrees
+    dims = model.dimensions
+    if dims.y > dims.x * 1.15:
+        model.rotation_euler = (0, 0, math.radians(90))
+        bpy.ops.object.transform_apply(rotation=True)
+
+    # centre on bounding box and scale to the real wingspan
+    bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
+    model.location = (0, 0, 0)
+    s = WINGSPAN_M / max(model.dimensions.x, 1e-6)
+    model.scale = (s, s, s)
+    bpy.ops.object.transform_apply(scale=True)
+    return model
+
+
+def build_props(parent, mat_blade, mat_disc, frames):
+    """Two tractor propellers above the leading edge, spinning about +Y."""
+    span = WINGSPAN_M
+    props = []
+    for i, side in enumerate((-1, 1)):
+        loc = (side * 0.27 * span, 0.22 * span, 0.06 * span)
+        bpy.ops.mesh.primitive_cube_add(size=1, location=loc)
+        blade = bpy.context.active_object
+        blade.name = f"Prop_{'LR'[i]}"
+        blade.scale = (0.22 * span, 0.004, 0.018 * span)
+        bpy.ops.object.transform_apply(scale=True)
+        blade.data.materials.append(mat_blade)
+        blade.parent = parent
+        blade.rotation_mode = "XYZ"
+        # motion-blur disc
+        bpy.ops.mesh.primitive_cylinder_add(radius=0.11 * span, depth=0.002,
+                                            location=loc, rotation=(math.radians(90), 0, 0))
+        disc = bpy.context.active_object
+        disc.name = f"PropDisc_{'LR'[i]}"
+        disc.data.materials.append(mat_disc)
+        disc.parent = parent
+        props.append(blade)
+
+    spin_per_frame = PROP_RPM / 60.0 / FPS * 2 * math.pi
+    spin_per_frame = spin_per_frame % (2 * math.pi) or 0.9  # avoid strobing
+    spin_per_frame = min(spin_per_frame, 1.1)
+    for k, blade in enumerate(props):
+        direction = 1 if k == 0 else -1  # counter-rotating
+        angle = 0.0
+        for f in range(1, frames + 1):
+            t = (f - 1) / FPS
+            spool = smoothstep(t / T_IDLE)
+            angle += direction * spin_per_frame * spool
+            if f % 2 == 1 or f == frames:
+                blade.rotation_euler = (0, angle, 0)
+                blade.keyframe_insert("rotation_euler", index=1, frame=f)
+        set_linear(blade)
+    return props
+
+
+def set_linear(ob):
+    if not ob.animation_data or not ob.animation_data.action:
+        return
+    action = ob.animation_data.action
+    curves = getattr(action, "fcurves", None)
+    if curves is None:  # Blender 5 layered actions
+        curves = [fc for layer in action.layers for strip in layer.strips
+                  for bag in strip.channelbags for fc in bag.fcurves]
+    for fc in curves:
+        for kp in fc.keyframe_points:
+            kp.interpolation = "LINEAR"
+
+
+# --------------------------------------------------------------------------
+# Environment
+# --------------------------------------------------------------------------
+
+def build_world(scene):
+    world = bpy.data.worlds.new("Sky")
+    scene.world = world
+    world.use_nodes = True
+    nt = world.node_tree
+    bg = nt.nodes["Background"]
+    try:
+        sky = nt.nodes.new("ShaderNodeTexSky")
+        for t in ("NISHITA", "MULTIPLE_SCATTERING", "SINGLE_SCATTERING"):
+            try:
+                sky.sky_type = t
+                break
+            except TypeError:
+                continue
+        sky.sun_elevation = math.radians(28)
+        sky.sun_rotation = math.radians(210)
+        nt.links.new(sky.outputs["Color"], bg.inputs["Color"])
+        bg.inputs["Strength"].default_value = 0.2
+    except Exception:
+        bg.inputs["Color"].default_value = (0.55, 0.7, 0.9, 1)
+    bpy.ops.object.light_add(type="SUN", rotation=(math.radians(55), 0, math.radians(30)))
+    sun = bpy.context.active_object
+    sun.data.energy = 2.5
+    sun.data.angle = math.radians(1.5)
+
+
+def build_city(route):
+    rng = random.Random(SEED)
+    m_ground = material("Ground", (0.18, 0.2, 0.17), rough=0.95)
+    m_road = material("Road", (0.06, 0.06, 0.07), rough=0.9)
+    m_bld = [material(f"Building_{i}", c, rough=0.8) for i, c in enumerate(
+        [(0.72, 0.7, 0.66), (0.55, 0.57, 0.6), (0.82, 0.78, 0.7), (0.4, 0.42, 0.45)])]
+    m_pad = material("Pad", (0.95, 0.42, 0.08), rough=0.5)
+    m_lawn = material("Lawn", (0.16, 0.38, 0.12), rough=0.95)
+
+    bpy.ops.mesh.primitive_plane_add(size=3000, location=(300, 120, 0))
+    bpy.context.active_object.name = "Ground"
+    bpy.context.active_object.data.materials.append(m_ground)
+
+    block, street = 46.0, 14.0
+    pitch = block + street
+    start, end = Vector((0, 0)), ROUTE_END
+    for gx in range(-8, 18):
+        for gy in range(-8, 14):
+            cx, cy = gx * pitch, gy * pitch
+            c = Vector((cx, cy))
+            if (c - start).length < 40 or (c - end).length < 55:
+                continue
+            for sx in (-1, 1):
+                for sy in (-1, 1):
+                    if rng.random() < 0.15:
+                        continue
+                    w = rng.uniform(12, 20)
+                    d = rng.uniform(12, 20)
+                    dist = min((c - p).length for p in route[::8])
+                    tall = 1.0 if dist > 150 else 0.6
+                    h = rng.choice([rng.uniform(6, 14), rng.uniform(10, 30) * tall,
+                                    rng.uniform(25, 45) * tall])
+                    add_box("Building", (w, d, h),
+                            (cx + sx * block / 4, cy + sy * block / 4, h / 2),
+                            rng.choice(m_bld))
+    for gx in range(-8, 19):
+        add_box("Road", (street, pitch * 22, 0.05), (gx * pitch - pitch / 2, 3 * pitch, 0.02), m_road)
+    for gy in range(-8, 15):
+        add_box("Road", (pitch * 26, street, 0.05), (5 * pitch, gy * pitch - pitch / 2, 0.03), m_road)
+
+    # hub building with rooftop pad
+    add_box("Hub", (24, 24, HUB_HEIGHT_M), (0, 0, HUB_HEIGHT_M / 2), m_bld[1])
+    bpy.ops.mesh.primitive_cylinder_add(radius=3.0, depth=0.1, location=(0, 0, HUB_HEIGHT_M + 0.05))
+    bpy.context.active_object.name = "Hub_Pad"
+    bpy.context.active_object.data.materials.append(m_pad)
+
+    # drop zone: garden with a target marker
+    add_box("DropZone_Lawn", (40, 40, 0.1), (end.x, end.y, 0.05), m_lawn)
+    bpy.ops.mesh.primitive_torus_add(major_radius=1.6, minor_radius=0.12,
+                                     location=(end.x, end.y, 0.15))
+    bpy.context.active_object.name = "DropZone_Target"
+    bpy.context.active_object.data.materials.append(m_pad)
+    add_box("House", (10, 8, 6), (end.x - 14, end.y + 10, 3), m_bld[2])
+
+
+# --------------------------------------------------------------------------
+# Flight model
+# --------------------------------------------------------------------------
+
+def make_route(samples=400):
+    """Cubic Bezier from hub to drop zone; returns arclength-sampled points."""
+    p0 = Vector((0.0, 0.0))
+    p3 = ROUTE_END.copy()
+    d = (p3 - p0)
+    n = Vector((-d.y, d.x)).normalized()
+    p1 = p0 + d * 0.3 + n * ROUTE_BEND
+    p2 = p0 + d * 0.7 - n * ROUTE_BEND * 0.6
+    pts = []
+    for i in range(samples + 1):
+        u = i / samples
+        pts.append((1 - u) ** 3 * p0 + 3 * (1 - u) ** 2 * u * p1
+                   + 3 * (1 - u) * u ** 2 * p2 + u ** 3 * p3)
+    cum = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        cum.append(cum[-1] + (b - a).length)
+    return pts, cum
+
+
+def route_at(pts, cum, s):
+    s = max(0.0, min(cum[-1], s))
+    lo, hi = 0, len(cum) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if cum[mid] <= s:
+            lo = mid
+        else:
+            hi = mid
+    seg = cum[hi] - cum[lo] or 1e-6
+    f = (s - cum[lo]) / seg
+    p = pts[lo].lerp(pts[hi], f)
+    tangent = (pts[hi] - pts[lo]).normalized()
+    # curvature from neighbouring tangents (signed, +left)
+    i0, i2 = max(lo - 3, 0), min(hi + 3, len(pts) - 1)
+    t0 = (pts[min(i0 + 1, len(pts) - 1)] - pts[i0]).normalized()
+    t2 = (pts[i2] - pts[max(i2 - 1, 0)]).normalized()
+    ds = max(cum[i2] - cum[i0], 1e-6)
+    cross = t0.x * t2.y - t0.y * t2.x
+    k = math.asin(max(-1, min(1, cross))) / ds
+    return p, tangent, k
+
+
+def simulate(pts, cum):
+    """Return per-frame state dicts: pos, yaw, pitch, roll, winch, released."""
+    L = cum[-1]
+    vc = CRUISE_SPEED_MS
+    # distance covered during each transition: mean speed vc/2
+    d_tr = vc * T_TRANSITION / 2
+    t_cruise = max(0.0, (L - 2 * d_tr) / vc)
+
+    t1 = T_IDLE
+    t2 = t1 + T_CLIMB
+    t3 = t2 + T_TRANSITION
+    t4 = t3 + t_cruise
+    t5 = t4 + T_TRANSITION
+    t6 = t5 + T_DESCEND
+    t7 = t6 + T_LOWER
+    t8 = t7 + T_RELEASE
+    t9 = t8 + T_RETRACT
+    t10 = t9 + T_DEPART_CLIMB
+    t11 = t10 + T_TRANSITION
+    t12 = t11 + T_DEPART
+    phases = dict(idle=t1, climb=t2, transition=t3, cruise=t4, back=t5,
+                  descend=t6, lower=t7, release=t8, retract=t9,
+                  depart_climb=t10, depart_tr=t11, end=t12)
+
+    end_p, end_tan, _ = route_at(pts, cum, L)
+    hover_pitch = math.radians(90)
+    cruise_pitch = math.radians(4)
+    tether_max = HOVER_DROP_ALT_M - 0.4
+    states = []
+    frames = int(math.ceil(t12 * FPS)) + 1
+    s_depart = 0.0
+    for f in range(frames):
+        t = f / FPS
+        winch, released = 0.0, t >= t8
+        pitch, roll = hover_pitch, 0.0
+        if t < t1:
+            s, z = 0.0, HUB_HEIGHT_M + 0.35
+        elif t < t2:
+            s = 0.0
+            z = HUB_HEIGHT_M + 0.35 + (CRUISE_ALT_M - HUB_HEIGHT_M) * smoothstep((t - t1) / T_CLIMB)
+        elif t < t3:
+            u = (t - t2) / T_TRANSITION
+            s = vc * T_TRANSITION * (u * u / 2)          # v ramps 0 -> vc
+            z = CRUISE_ALT_M + 3.0 * math.sin(math.pi * u)  # small balloon during transition
+            pitch = hover_pitch + (cruise_pitch - hover_pitch) * smoothstep(u * 1.15)
+        elif t < t4:
+            s = d_tr + vc * (t - t3)
+            z = CRUISE_ALT_M
+            pitch = cruise_pitch
+        elif t < t5:
+            u = (t - t4) / T_TRANSITION
+            s = L - d_tr + vc * T_TRANSITION * (u - u * u / 2)  # v ramps vc -> 0
+            z = CRUISE_ALT_M + 4.0 * math.sin(math.pi * u)     # flare
+            pitch = cruise_pitch + (hover_pitch - cruise_pitch) * smoothstep(u * 1.1)
+        elif t < t6:
+            s = L
+            z = CRUISE_ALT_M + (HOVER_DROP_ALT_M - CRUISE_ALT_M) * smoothstep((t - t5) / T_DESCEND)
+        elif t < t9:
+            s, z = L, HOVER_DROP_ALT_M
+            if t < t7:
+                winch = smoothstep((t - t6) / T_LOWER)
+            elif t < t8:
+                winch = 1.0
+            else:
+                winch = 1.0 - smoothstep((t - t8) / T_RETRACT)
+        elif t < t10:
+            s = L
+            z = HOVER_DROP_ALT_M + (CRUISE_ALT_M - HOVER_DROP_ALT_M) * smoothstep((t - t9) / T_DEPART_CLIMB)
+        else:
+            s = L
+            u = min((t - t10) / T_TRANSITION, 1.0)
+            if t < t11:
+                s_depart = vc * T_TRANSITION * (u * u / 2)
+                pitch = hover_pitch + (cruise_pitch - hover_pitch) * smoothstep(u * 1.15)
+            else:
+                s_depart = vc * T_TRANSITION / 2 + vc * (t - t11)
+                pitch = cruise_pitch
+            z = CRUISE_ALT_M + 3.0 * math.sin(math.pi * u)
+
+        if t >= t10:
+            p2 = end_p + end_tan * s_depart
+            tan, k, v = end_tan, 0.0, vc
+        else:
+            p2, tan, k = route_at(pts, cum, s)
+            v = 0.0
+            if t2 <= t < t3:
+                v = vc * (t - t2) / T_TRANSITION
+            elif t3 <= t < t4:
+                v = vc
+            elif t4 <= t < t5:
+                v = vc * (1 - (t - t4) / T_TRANSITION)
+
+        # coordinated turn: bank so lift balances centripetal force
+        if pitch < math.radians(45):
+            roll = -math.atan(v * v * k / G)
+        # gusts while hovering (stronger near the ground / during winching)
+        hover_w = 1.0 if pitch > math.radians(60) and t > t1 else 0.0
+        gx = noise.noise(Vector((t * 0.6, 0.0, 1.3))) * 0.35 * hover_w
+        gy = noise.noise(Vector((0.0, t * 0.6, 4.1))) * 0.35 * hover_w
+        gz = noise.noise(Vector((2.2, 7.7, t * 0.5))) * 0.15 * hover_w
+        pos = Vector((p2.x + gx, p2.y + gy, z + gz))
+        yaw = math.atan2(-tan.x, tan.y)
+        roll += gx * 0.25
+        states.append(dict(t=t, pos=pos, yaw=yaw, pitch=pitch, roll=roll,
+                           winch=winch * tether_max, released=released))
+    return states, phases
+
+
+# --------------------------------------------------------------------------
+# Animation
+# --------------------------------------------------------------------------
+
+def attitude_matrix(st):
+    # model frame: nose +Y, wings X, top +Z. Pitch about X, roll about Y, yaw about Z.
+    return Euler((st["pitch"], st["roll"], st["yaw"]), "YXZ").to_matrix()
+
+
+def animate(scene, model, states, phases):
+    rig = bpy.data.objects.new("Drone_Rig", None)
+    scene.collection.objects.link(rig)
+    rig.empty_display_size = WINGSPAN_M
+    rig.rotation_mode = "YXZ"
+    model.parent = rig
+
+    m_parcel = material("Parcel", (0.62, 0.45, 0.28), rough=0.85)
+    m_tether = material("Tether", (0.9, 0.9, 0.9), rough=0.5)
+    parcel = add_box("Parcel", (0.22, 0.22, 0.16), (0, 0, 0), m_parcel)
+    bpy.ops.mesh.primitive_cylinder_add(radius=0.006, depth=1.0)
+    tether = bpy.context.active_object
+    tether.name = "Tether"
+    tether.data.materials.append(m_tether)
+    # move tether origin to its top so scale.z = length
+    for v in tether.data.vertices:
+        v.co.z -= 0.5
+
+    belly = Vector((0, -0.05 * WINGSPAN_M, -0.12 * WINGSPAN_M))  # parcel bay, model frame
+    swing = Vector((0.0, 0.0))
+    swing_v = Vector((0.0, 0.0))
+    prev_anchor = None
+    parcel_ground = None
+    for i, st in enumerate(states):
+        f = i + 1
+        rot = attitude_matrix(st)
+        rig.location = st["pos"]
+        rig.rotation_euler = Euler((st["pitch"], st["roll"], st["yaw"]), "YXZ")
+        rig.keyframe_insert("location", frame=f)
+        rig.keyframe_insert("rotation_euler", frame=f)
+
+        anchor = st["pos"] + rot @ belly
+        length = st["winch"]
+        if st["released"] and parcel_ground is None:
+            parcel_ground = Vector((anchor.x + swing.x, anchor.y + swing.y, 0.08))
+        if parcel_ground is not None:
+            parcel.location = parcel_ground
+            parcel.rotation_euler = (0, 0, st["yaw"])
+        elif length > 0.05:
+            # damped pendulum: the parcel lags behind anchor motion
+            dt = 1.0 / FPS
+            if prev_anchor is not None:
+                acc = -(anchor - prev_anchor).xy / dt * 0.8
+            else:
+                acc = Vector((0, 0))
+            omega2 = G / max(length, 0.5)
+            swing_v += (acc * dt * 2.0 - swing * omega2 * dt - swing_v * 0.9 * dt)
+            swing += swing_v * dt
+            swing.x = max(-1.5, min(1.5, swing.x))
+            swing.y = max(-1.5, min(1.5, swing.y))
+            parcel.location = anchor + Vector((swing.x, swing.y, -length))
+            parcel.rotation_euler = (0, 0, st["yaw"])
+        else:
+            parcel.location = anchor
+            parcel.rotation_euler = rot.to_euler("XYZ")
+        prev_anchor = anchor
+        parcel.keyframe_insert("location", frame=f)
+        parcel.keyframe_insert("rotation_euler", frame=f)
+
+        # tether from anchor down to the parcel (or retracting after release)
+        top = anchor
+        bottom = parcel.location if parcel_ground is None else anchor - Vector((0, 0, length))
+        vec = bottom - top
+        tether.location = top
+        tether.rotation_euler = vec.to_track_quat("-Z", "Y").to_euler()
+        tether.scale = (1, 1, max(vec.length, 0.001))
+        tether.hide_render = length < 0.05
+        tether.hide_viewport = length < 0.05
+        for path in ("location", "rotation_euler", "scale", "hide_render", "hide_viewport"):
+            tether.keyframe_insert(path, frame=f)
+
+    scene.frame_start = 1
+    scene.frame_end = len(states)
+    for name, t in phases.items():
+        scene.timeline_markers.new(name, frame=int(t * FPS) + 1)
+    return rig
+
+
+def build_cameras(scene, rig, states, phases):
+    """Chase cam baked with lag, a hub observer and a ground cam at the drop zone."""
+    chase = bpy.data.objects.new("Cam_Chase", bpy.data.cameras.new("Cam_Chase"))
+    scene.collection.objects.link(chase)
+    chase.data.lens = 35
+    track = chase.constraints.new("TRACK_TO")
+    track.target = rig
+    track.track_axis = "TRACK_NEGATIVE_Z"
+    track.up_axis = "UP_Y"
+    cam_pos = None
+    for i, st in enumerate(states):
+        fwd = Vector((-math.sin(st["yaw"]), math.cos(st["yaw"]), 0))
+        side = Vector((math.cos(st["yaw"]), math.sin(st["yaw"]), 0))
+        target = st["pos"] - fwd * 7.0 + side * 2.5 + Vector((0, 0, 2.2))
+        cam_pos = target if cam_pos is None else cam_pos.lerp(target, 0.12)
+        chase.location = cam_pos
+        chase.keyframe_insert("location", frame=i + 1)
+
+    def static_cam(name, loc, lens, target=rig):
+        cam = bpy.data.objects.new(name, bpy.data.cameras.new(name))
+        scene.collection.objects.link(cam)
+        cam.location = loc
+        cam.data.lens = lens
+        c = cam.constraints.new("TRACK_TO")
+        c.target = target
+        c.track_axis = "TRACK_NEGATIVE_Z"
+        c.up_axis = "UP_Y"
+        return cam
+
+    hub_cam = static_cam("Cam_Hub", (6, -8, HUB_HEIGHT_M + 2.2), 35)
+    end = ROUTE_END
+    # frames the hovering drone, the tether and the drop target together
+    focus = bpy.data.objects.new("DropZone_Focus", None)
+    scene.collection.objects.link(focus)
+    focus.location = (end.x, end.y, HOVER_DROP_ALT_M * 0.55)
+    drop_cam = static_cam("Cam_DropZone", (end.x + 12, end.y - 16, 2.5), 18, focus)
+
+    # camera cuts via markers
+    def cut(cam, t):
+        m = scene.timeline_markers.new(f"cut_{cam.name}", frame=int(t * FPS) + 1)
+        m.camera = cam
+
+    cut(hub_cam, 0)
+    cut(chase, phases["climb"] - 1.0)
+    cut(drop_cam, phases["back"] + 1.0)
+    cut(chase, phases["retract"])
+    scene.camera = hub_cam
+
+
+def setup_render(scene, out_path):
+    for engine in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
+        try:
+            scene.render.engine = engine
+            break
+        except TypeError:
+            continue
+    scene.render.resolution_x = 1920
+    scene.render.resolution_y = 1080
+    scene.render.use_motion_blur = True
+    try:
+        scene.view_settings.view_transform = "AgX"
+    except TypeError:
+        scene.view_settings.view_transform = "Filmic"
+    scene.view_settings.exposure = -0.5
+    if out_path:
+        scene.render.filepath = out_path
+        try:
+            scene.render.image_settings.media_type = "VIDEO"  # Blender 5+
+        except AttributeError:
+            pass
+        scene.render.image_settings.file_format = "FFMPEG"
+        scene.render.ffmpeg.format = "MPEG4"
+        scene.render.ffmpeg.codec = "H264"
+        scene.render.ffmpeg.constant_rate_factor = "HIGH"
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main():
+    opts = parse_cli()
+    scene = reset_scene()
+    build_world(scene)
+
+    pts, cum = make_route()
+    build_city(pts)
+
+    m_carbon = material("Carbon_Fallback", (0.04, 0.04, 0.045), rough=0.35, metal=0.2)
+    model = import_drone(opts["glb"], m_carbon)
+
+    states, phases = simulate(pts, cum)
+    rig = animate(scene, model, states, phases)
+    build_props(model, material("PropBlade", (0.05, 0.05, 0.05), rough=0.4),
+                material("PropDisc", (0.1, 0.1, 0.1), alpha=0.15), len(states))
+    build_cameras(scene, rig, states, phases)
+    setup_render(scene, opts["render"])
+
+    print("[airbound] mission timeline (s): " +
+          ", ".join(f"{k}={v:.1f}" for k, v in phases.items()))
+    print(f"[airbound] route length {cum[-1]:.0f} m, {len(states)} frames @ {FPS} fps")
+
+    if opts["engine"]:
+        scene.render.engine = opts["engine"]
+        if opts["engine"] == "CYCLES":
+            scene.cycles.samples = 24
+            scene.render.resolution_percentage = 50
+    if opts["blend"]:
+        os.makedirs(os.path.dirname(os.path.abspath(opts["blend"])), exist_ok=True)
+        bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(opts["blend"]))
+    if opts["stills"]:
+        os.makedirs(opts["stills"], exist_ok=True)
+        for name, t in phases.items():
+            f = min(int(t * FPS) - FPS // 2, scene.frame_end)
+            scene.frame_set(max(f, 1))
+            scene.render.image_settings.file_format = "PNG"
+            scene.render.filepath = os.path.join(opts["stills"], f"{f:05d}_{name}.png")
+            bpy.ops.render.render(write_still=True)
+    if opts["render"]:
+        bpy.ops.render.render(animation=True)
+
+
+if __name__ == "__main__":
+    main()
