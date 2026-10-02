@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Airbound — Fly a Delivery</title>
+    <meta name="description" content="Take the controls of a tailsitter delivery drone: take off, fly across the city and land on a delivery site." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <canvas id="scene"></canvas>
+    <div class="vignette"></div>
+    <div class="letterbox top"></div>
+    <div class="letterbox bottom"></div>
+
+    <header class="nav">
+      <a class="brand" href="#top">AIRBOUND</a>
+      <nav>
+        <a href="#how">How it flies</a>
+        <a href="#specs">Specs</a>
+        <button class="nav-cta" data-action="takeoff">Fly a delivery</button>
+      </nav>
+    </header>
+
+    <main>
+      <section id="top" class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Tailsitter delivery drone · Interactive</p>
+          <h1>Lifts off like a helicopter.<br />Flies like a plane.</h1>
+          <p class="lede">
+            Take the controls. Lift off from the hub, fly across the city and set the parcel down
+            on one of four delivery sites. Your landing is scored on how close and how soft it is.
+          </p>
+          <div class="hero-actions">
+            <button class="btn-primary" data-action="takeoff">
+              <span class="dot"></span> Take off
+            </button>
+            <a class="btn-ghost" href="#how">How it flies</a>
+          </div>
+          <ul class="keys">
+            <li><kbd>↑</kbd><kbd>↓</kbd> speed</li>
+            <li><kbd>←</kbd><kbd>→</kbd> turn</li>
+            <li><kbd>W</kbd><kbd>S</kbd> climb / descend</li>
+            <li><kbd>Space</kbd> brake to hover</li>
+          </ul>
+        </div>
+        <div class="scroll-hint">Scroll</div>
+      </section>
+
+      <section id="how" class="panel">
+        <h2>How a delivery flies</h2>
+        <ol class="steps">
+          <li><span>01</span><h3>Vertical take-off</h3><p>The drone stands on its tail and climbs straight up off a rooftop pad. It doesn't need a runway.</p></li>
+          <li><span>02</span><h3>Transition</h3><p>As speed builds it pitches over until the wing carries the weight, which is far more efficient than a quadcopter.</p></li>
+          <li><span>03</span><h3>Cruise</h3><p>Wing-borne at around 80 km/h, it banks through coordinated turns across the city.</p></li>
+          <li><span>04</span><h3>Precision drop</h3><p>It pitches back up to hover over the site, descends, and lowers the parcel on a tether.</p></li>
+        </ol>
+      </section>
+
+      <section id="specs" class="panel">
+        <h2>Simulation parameters</h2>
+        <div class="specs">
+          <div><b>1.6 m</b><span>Wingspan</span></div>
+          <div><b>80 km/h</b><span>Cruise speed</span></div>
+          <div><b>60 m</b><span>Cruise altitude</span></div>
+          <div><b>18 m</b><span>Tether drop height</span></div>
+        </div>
+        <p class="note">Values are the inputs to this demo and to the Blender film, not certified performance figures.</p>
+        <button class="btn-primary" data-action="takeoff"><span class="dot"></span> Fly a delivery</button>
+      </section>
+      <footer>Airbound flight demo · Three.js</footer>
+    </main>
+
+    <!-- in-flight UI -->
+    <div id="hud" hidden>
+      <div class="hud-left">
+        <div class="readout"><span>ALT</span><b id="h-alt">0</b><i>m</i></div>
+        <div class="readout"><span>SPD</span><b id="h-spd">0</b><i>km/h</i></div>
+        <div class="readout"><span>V/S</span><b id="h-vs">0</b><i>m/s</i></div>
+        <div class="mode" id="h-mode">HOVER</div>
+        <div class="transition"><div id="h-trans"></div></div>
+      </div>
+      <div class="hud-right">
+        <div class="target-label">Nearest site</div>
+        <div class="target" id="h-target">—</div>
+        <div class="target-dist" id="h-dist"></div>
+      </div>
+      <canvas id="minimap" width="180" height="180"></canvas>
+      <div class="hud-keys">
+        <span><kbd>↑</kbd><kbd>↓</kbd> speed</span>
+        <span><kbd>←</kbd><kbd>→</kbd> turn</span>
+        <span><kbd>W</kbd><kbd>S</kbd> alt</span>
+        <span><kbd>Space</kbd> hover</span>
+        <span><kbd>C</kbd> camera</span>
+        <span><kbd>Esc</kbd> exit</span>
+      </div>
+      <div id="labels"></div>
+      <div id="toast"></div>
+      <div id="touch" class="touch">
+        <div class="pad">
+          <button data-key="ArrowUp">↑</button>
+          <button data-key="ArrowLeft">←</button>
+          <button data-key="ArrowDown">↓</button>
+          <button data-key="ArrowRight">→</button>
+        </div>
+        <div class="pad alt">
+          <button data-key="KeyW">W</button>
+          <button data-key="KeyS">S</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="result" class="result" hidden>
+      <p class="eyebrow" id="r-eyebrow">Delivered</p>
+      <h2 id="r-title">Smooth delivery</h2>
+      <div class="r-score"><b id="r-score">0</b><span>/100</span></div>
+      <dl id="r-stats"></dl>
+      <div class="hero-actions">
+        <button class="btn-primary" data-action="again"><span class="dot"></span> Take off again</button>
+        <button class="btn-ghost" data-action="reset">Back to hub</button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
