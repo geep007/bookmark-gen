@@ -35,6 +35,7 @@ import random
 import sys
 
 import bpy
+import bmesh  # noqa: E402  (bmesh needs bpy loaded first)
 from mathutils import Euler, Matrix, Vector, noise
 
 # --------------------------------------------------------------------------
@@ -113,19 +114,74 @@ def material(name, color, rough=0.6, metal=0.0, emit=None, alpha=1.0):
     return mat
 
 
-def add_box(name, size, loc, mat):
-    bpy.ops.mesh.primitive_cube_add(size=1, location=loc)
-    ob = bpy.context.active_object
-    ob.name = name
-    ob.scale = size
-    bpy.ops.object.transform_apply(scale=True)
-    ob.data.materials.append(mat)
+def link(ob):
+    bpy.context.scene.collection.objects.link(ob)
     return ob
 
 
+def mesh_object(name, build, mat=None, loc=(0, 0, 0)):
+    """Create a mesh object from a bmesh builder without bpy.ops, so the
+    script works from the Text Editor as well as from the command line."""
+    me = bpy.data.meshes.new(name)
+    bm = bmesh.new()
+    build(bm)
+    bm.to_mesh(me)
+    bm.free()
+    if mat:
+        me.materials.append(mat)
+    ob = bpy.data.objects.new(name, me)
+    ob.location = loc
+    return link(ob)
+
+
+def trs(loc=(0, 0, 0), rot=(0, 0, 0), size=(1, 1, 1)):
+    return (Matrix.Translation(loc) @ Euler(rot).to_matrix().to_4x4()
+            @ Matrix.Diagonal(Vector((*size, 1.0))))
+
+
+def cube(bm, **kw):
+    bmesh.ops.create_cube(bm, size=1.0, matrix=trs(**kw))
+
+
+def cylinder(bm, radius, depth, segments=24, **kw):
+    bmesh.ops.create_cone(bm, cap_ends=True, segments=segments, radius1=radius,
+                          radius2=radius, depth=depth, matrix=trs(**kw))
+
+
+def sphere(bm, **kw):
+    bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=0.5, matrix=trs(**kw))
+
+
+def torus(bm, major, minor, seg=48, ring=12):
+    verts = []
+    for i in range(seg):
+        a = 2 * math.pi * i / seg
+        row = []
+        for j in range(ring):
+            b = 2 * math.pi * j / ring
+            r = major + minor * math.cos(b)
+            row.append(bm.verts.new((r * math.cos(a), r * math.sin(a), minor * math.sin(b))))
+        verts.append(row)
+    for i in range(seg):
+        for j in range(ring):
+            bm.faces.new((verts[i][j], verts[(i + 1) % seg][j],
+                          verts[(i + 1) % seg][(j + 1) % ring], verts[i][(j + 1) % ring]))
+
+
+def add_box(name, size, loc, mat):
+    return mesh_object(name, lambda bm: cube(bm, size=size), mat, loc)
+
+
 def reset_scene():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
+    for ob in list(scene.objects):
+        bpy.data.objects.remove(ob, do_unlink=True)
+    for coll in (bpy.data.meshes, bpy.data.materials, bpy.data.cameras,
+                 bpy.data.lights, bpy.data.actions, bpy.data.worlds):
+        for block in list(coll):
+            if block.users == 0:
+                coll.remove(block)
+    scene.timeline_markers.clear()
     scene.render.fps = FPS
     scene.unit_settings.system = "METRIC"
     return scene
@@ -137,78 +193,58 @@ def reset_scene():
 
 def build_standin_drone(mat):
     """Blended-wing-body tailsitter built from primitives (used when no GLB)."""
-    parts = []
-    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, location=(0, 0, 0))
-    body = bpy.context.active_object
-    body.scale = (0.32, 0.9, 0.22)
-    parts.append(body)
-    for side in (-1, 1):
-        bpy.ops.mesh.primitive_cube_add(size=1, location=(side * 0.55, -0.05, -0.02))
-        wing = bpy.context.active_object
-        wing.scale = (0.85, 0.32, 0.03)
-        wing.rotation_euler = (0, side * math.radians(-8), side * math.radians(-18))
-        parts.append(wing)
-        bpy.ops.mesh.primitive_cube_add(size=1, location=(side * 0.12, -0.25, -0.18))
-        fin = bpy.context.active_object
-        fin.scale = (0.02, 0.28, 0.2)
-        parts.append(fin)
-        bpy.ops.mesh.primitive_cylinder_add(radius=0.025, depth=0.14,
-                                            location=(side * 0.42, 0.2, 0.08))
-        parts.append(bpy.context.active_object)
-    for p in parts:
-        p.data.materials.append(mat)
-    bpy.ops.object.select_all(action="DESELECT")
-    for p in parts:
-        p.select_set(True)
-    bpy.context.view_layer.objects.active = body
-    bpy.ops.object.join()
-    body.name = "Drone_Model"
-    return body
+    def build(bm):
+        sphere(bm, size=(0.32, 0.9, 0.22))
+        for side in (-1, 1):
+            cube(bm, loc=(side * 0.55, -0.05, -0.02),
+                 rot=(0, side * math.radians(-8), side * math.radians(-18)),
+                 size=(0.85, 0.32, 0.03))
+            cube(bm, loc=(side * 0.12, -0.25, -0.18), size=(0.02, 0.28, 0.2))
+            cylinder(bm, 0.025, 0.14, 12, loc=(side * 0.42, 0.2, 0.08))
+    return mesh_object("Drone_Model", build, mat)
+
+
+def world_bounds(objs):
+    bpy.context.view_layer.update()
+    pts = [o.matrix_world @ Vector(c) for o in objs for c in o.bound_box]
+    lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    return lo, hi
 
 
 def import_drone(glb_path, mat_fallback):
-    if glb_path and os.path.exists(os.path.expanduser(glb_path)):
-        before = set(bpy.data.objects)
-        bpy.ops.import_scene.gltf(filepath=os.path.expanduser(glb_path))
-        new = [o for o in bpy.data.objects if o not in before]
-        meshes = [o for o in new if o.type == "MESH"]
-        bpy.ops.object.select_all(action="DESELECT")
-        for o in meshes:
-            o.select_set(True)
-        bpy.context.view_layer.objects.active = meshes[0]
-        bpy.ops.object.parent_clear(type="CLEAR_KEEP_TRANSFORM")
-        if len(meshes) > 1:
-            bpy.ops.object.join()
-        model = bpy.context.active_object
-        for o in new:
-            if o.name in bpy.data.objects and o is not model and o.type != "MESH":
-                bpy.data.objects.remove(o, do_unlink=True)
-        model.name = "Drone_Model"
-        print(f"[airbound] imported {glb_path}")
-    else:
+    path = os.path.expanduser(glb_path) if glb_path else ""
+    if not (path and os.path.exists(path)):
         if glb_path:
             print(f"[airbound] GLB not found at {glb_path}; using stand-in drone")
-        model = build_standin_drone(mat_fallback)
+        return build_standin_drone(mat_fallback)
 
-    # user orientation correction
-    model.rotation_euler = Euler([math.radians(a) for a in MODEL_ROTATION_DEG])
-    bpy.ops.object.select_all(action="DESELECT")
-    model.select_set(True)
-    bpy.context.view_layer.objects.active = model
-    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+    before = set(bpy.data.objects)
+    bpy.ops.import_scene.gltf(filepath=path)
+    new = [o for o in bpy.data.objects if o not in before]
+    meshes = [o for o in new if o.type == "MESH"]
+    print(f"[airbound] imported {glb_path} ({len(meshes)} meshes)")
+
+    # Drone_Model (clean frame the props attach to) > Drone_Fix (orientation
+    # and scale correction) > imported GLB hierarchy
+    model = link(bpy.data.objects.new("Drone_Model", None))
+    fix = link(bpy.data.objects.new("Drone_Fix", None))
+    for o in new:
+        if o.parent is None:
+            o.parent = fix
+    fix.rotation_euler = Euler([math.radians(a) for a in MODEL_ROTATION_DEG])
 
     # wings must lie along X: if the model is wider along Y, turn it 90 degrees
-    dims = model.dimensions
-    if dims.y > dims.x * 1.15:
-        model.rotation_euler = (0, 0, math.radians(90))
-        bpy.ops.object.transform_apply(rotation=True)
+    lo, hi = world_bounds(meshes)
+    if (hi.y - lo.y) > (hi.x - lo.x) * 1.15:
+        fix.rotation_euler.z += math.radians(90)
+        lo, hi = world_bounds(meshes)
 
-    # centre on bounding box and scale to the real wingspan
-    bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
-    model.location = (0, 0, 0)
-    s = WINGSPAN_M / max(model.dimensions.x, 1e-6)
-    model.scale = (s, s, s)
-    bpy.ops.object.transform_apply(scale=True)
+    # centre on the bounding box and scale to the real wingspan
+    s = WINGSPAN_M / max(hi.x - lo.x, 1e-6)
+    fix.scale = (s, s, s)
+    fix.location = -(lo + hi) / 2 * s
+    fix.parent = model
     return model
 
 
@@ -218,20 +254,16 @@ def build_props(parent, mat_blade, mat_disc, frames):
     props = []
     for i, side in enumerate((-1, 1)):
         loc = (side * 0.27 * span, 0.22 * span, 0.06 * span)
-        bpy.ops.mesh.primitive_cube_add(size=1, location=loc)
-        blade = bpy.context.active_object
-        blade.name = f"Prop_{'LR'[i]}"
-        blade.scale = (0.22 * span, 0.004, 0.018 * span)
-        bpy.ops.object.transform_apply(scale=True)
-        blade.data.materials.append(mat_blade)
+        blade = mesh_object(f"Prop_{'LR'[i]}",
+                            lambda bm: cube(bm, size=(0.22 * span, 0.004, 0.018 * span)),
+                            mat_blade, loc)
         blade.parent = parent
         blade.rotation_mode = "XYZ"
         # motion-blur disc
-        bpy.ops.mesh.primitive_cylinder_add(radius=0.11 * span, depth=0.002,
-                                            location=loc, rotation=(math.radians(90), 0, 0))
-        disc = bpy.context.active_object
-        disc.name = f"PropDisc_{'LR'[i]}"
-        disc.data.materials.append(mat_disc)
+        disc = mesh_object(f"PropDisc_{'LR'[i]}",
+                           lambda bm: cylinder(bm, 0.11 * span, 0.002, 32,
+                                               rot=(math.radians(90), 0, 0)),
+                           mat_disc, loc)
         disc.parent = parent
         props.append(blade)
 
@@ -289,8 +321,8 @@ def build_world(scene):
         bg.inputs["Strength"].default_value = 0.2
     except Exception:
         bg.inputs["Color"].default_value = (0.55, 0.7, 0.9, 1)
-    bpy.ops.object.light_add(type="SUN", rotation=(math.radians(55), 0, math.radians(30)))
-    sun = bpy.context.active_object
+    sun = link(bpy.data.objects.new("Sun", bpy.data.lights.new("Sun", "SUN")))
+    sun.rotation_euler = (math.radians(55), 0, math.radians(30))
     sun.data.energy = 2.5
     sun.data.angle = math.radians(1.5)
 
@@ -304,9 +336,7 @@ def build_city(route):
     m_pad = material("Pad", (0.95, 0.42, 0.08), rough=0.5)
     m_lawn = material("Lawn", (0.16, 0.38, 0.12), rough=0.95)
 
-    bpy.ops.mesh.primitive_plane_add(size=3000, location=(300, 120, 0))
-    bpy.context.active_object.name = "Ground"
-    bpy.context.active_object.data.materials.append(m_ground)
+    add_box("Ground", (3000, 3000, 0.02), (300, 120, -0.01), m_ground)
 
     block, street = 46.0, 14.0
     pitch = block + street
@@ -337,16 +367,13 @@ def build_city(route):
 
     # hub building with rooftop pad
     add_box("Hub", (24, 24, HUB_HEIGHT_M), (0, 0, HUB_HEIGHT_M / 2), m_bld[1])
-    bpy.ops.mesh.primitive_cylinder_add(radius=3.0, depth=0.1, location=(0, 0, HUB_HEIGHT_M + 0.05))
-    bpy.context.active_object.name = "Hub_Pad"
-    bpy.context.active_object.data.materials.append(m_pad)
+    mesh_object("Hub_Pad", lambda bm: cylinder(bm, 3.0, 0.1, 48), m_pad,
+                (0, 0, HUB_HEIGHT_M + 0.05))
 
     # drop zone: garden with a target marker
     add_box("DropZone_Lawn", (40, 40, 0.1), (end.x, end.y, 0.05), m_lawn)
-    bpy.ops.mesh.primitive_torus_add(major_radius=1.6, minor_radius=0.12,
-                                     location=(end.x, end.y, 0.15))
-    bpy.context.active_object.name = "DropZone_Target"
-    bpy.context.active_object.data.materials.append(m_pad)
+    mesh_object("DropZone_Target", lambda bm: torus(bm, 1.6, 0.12), m_pad,
+                (end.x, end.y, 0.15))
     add_box("House", (10, 8, 6), (end.x - 14, end.y + 10, 3), m_bld[2])
 
 
@@ -523,13 +550,9 @@ def animate(scene, model, states, phases):
     m_parcel = material("Parcel", (0.62, 0.45, 0.28), rough=0.85)
     m_tether = material("Tether", (0.9, 0.9, 0.9), rough=0.5)
     parcel = add_box("Parcel", (0.22, 0.22, 0.16), (0, 0, 0), m_parcel)
-    bpy.ops.mesh.primitive_cylinder_add(radius=0.006, depth=1.0)
-    tether = bpy.context.active_object
-    tether.name = "Tether"
-    tether.data.materials.append(m_tether)
-    # move tether origin to its top so scale.z = length
-    for v in tether.data.vertices:
-        v.co.z -= 0.5
+    # origin at the top so scale.z = length
+    tether = mesh_object("Tether", lambda bm: cylinder(bm, 0.006, 1.0, 8, loc=(0, 0, -0.5)),
+                         m_tether)
 
     belly = Vector((0, -0.05 * WINGSPAN_M, -0.12 * WINGSPAN_M))  # parcel bay, model frame
     swing = Vector((0.0, 0.0))
