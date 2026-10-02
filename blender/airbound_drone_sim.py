@@ -68,12 +68,18 @@ T_DEPART_CLIMB = 4.0
 T_DEPART = 6.0
 
 PROP_RPM = 4200
+
+# cinematic look
+SUN_ELEVATION_DEG = 11       # golden hour
+SUN_ROTATION_DEG = 205
+ASPECT = (1920, 804)         # 2.39:1 widescreen
+HAZE_DENSITY = 0.0009        # world volume, EEVEE only (too slow in Cycles)
 SEED = 7
 
 
 def parse_cli():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-    opts = {"glb": GLB_PATH, "render": "", "blend": "", "stills": "", "engine": ""}
+    opts = {"glb": GLB_PATH, "render": "", "blend": "", "stills": "", "engine": "", "percent": ""}
     i = 0
     while i < len(argv):
         key = argv[i].lstrip("-")
@@ -301,7 +307,7 @@ def set_linear(ob):
 # Environment
 # --------------------------------------------------------------------------
 
-def build_world(scene):
+def build_world(scene, haze=True):
     world = bpy.data.worlds.new("Sky")
     scene.world = world
     world.use_nodes = True
@@ -315,16 +321,36 @@ def build_world(scene):
                 break
             except TypeError:
                 continue
-        sky.sun_elevation = math.radians(28)
-        sky.sun_rotation = math.radians(210)
+        sky.sun_elevation = math.radians(SUN_ELEVATION_DEG)
+        sky.sun_rotation = math.radians(SUN_ROTATION_DEG)
+        if hasattr(sky, "air_density"):
+            sky.air_density = 1.4
+        if hasattr(sky, "dust_density"):
+            sky.dust_density = 2.5
         nt.links.new(sky.outputs["Color"], bg.inputs["Color"])
-        bg.inputs["Strength"].default_value = 0.2
+        bg.inputs["Strength"].default_value = 0.25
     except Exception:
-        bg.inputs["Color"].default_value = (0.55, 0.7, 0.9, 1)
+        bg.inputs["Color"].default_value = (0.75, 0.62, 0.5, 1)
+    if haze and HAZE_DENSITY > 0:
+        vol = nt.nodes.new("ShaderNodeVolumePrincipled")
+        vol.inputs["Density"].default_value = HAZE_DENSITY
+        vol.inputs["Color"].default_value = (0.95, 0.82, 0.68, 1)
+        vol.inputs["Anisotropy"].default_value = 0.6
+        out = nt.nodes["World Output"]
+        nt.links.new(vol.outputs["Volume"], out.inputs["Volume"])
+
+    # warm low key light aligned with the sky's sun, plus a cool fill
     sun = link(bpy.data.objects.new("Sun", bpy.data.lights.new("Sun", "SUN")))
-    sun.rotation_euler = (math.radians(55), 0, math.radians(30))
-    sun.data.energy = 2.5
-    sun.data.angle = math.radians(1.5)
+    sun.rotation_euler = (math.radians(90 - SUN_ELEVATION_DEG), 0,
+                          math.radians(SUN_ROTATION_DEG + 180))
+    sun.data.energy = 3.4
+    sun.data.color = (1.0, 0.78, 0.56)
+    sun.data.angle = math.radians(2.0)
+    fill = link(bpy.data.objects.new("Sky_Fill", bpy.data.lights.new("Sky_Fill", "SUN")))
+    fill.rotation_euler = (math.radians(20), 0, math.radians(SUN_ROTATION_DEG))
+    fill.data.energy = 0.35
+    fill.data.color = (0.62, 0.74, 1.0)
+    fill.data.use_shadow = False
 
 
 def build_city(route):
@@ -615,52 +641,131 @@ def animate(scene, model, states, phases):
 
 
 def build_cameras(scene, rig, states, phases):
-    """Chase cam baked with lag, a hub observer and a ground cam at the drop zone."""
-    chase = bpy.data.objects.new("Cam_Chase", bpy.data.cameras.new("Cam_Chase"))
-    scene.collection.objects.link(chase)
-    chase.data.lens = 35
-    track = chase.constraints.new("TRACK_TO")
-    track.target = rig
-    track.track_axis = "TRACK_NEGATIVE_Z"
-    track.up_axis = "UP_Y"
-    cam_pos = None
-    for i, st in enumerate(states):
-        fwd = Vector((-math.sin(st["yaw"]), math.cos(st["yaw"]), 0))
-        side = Vector((math.cos(st["yaw"]), math.sin(st["yaw"]), 0))
-        target = st["pos"] - fwd * 7.0 + side * 2.5 + Vector((0, 0, 2.2))
-        cam_pos = target if cam_pos is None else cam_pos.lerp(target, 0.12)
-        chase.location = cam_pos
-        chase.keyframe_insert("location", frame=i + 1)
+    """Cinematic shot list. Each shot is its own camera, cut in with markers."""
+    parcel = bpy.data.objects["Parcel"]
+    n = len(states)
+    end = ROUTE_END
+    end_tan = (Vector(states[int(phases["cruise"] * FPS)]["pos"].xy)
+               - Vector(states[int(phases["cruise"] * FPS) - FPS]["pos"].xy)).normalized()
+    end_side = Vector((end_tan.y, -end_tan.x))
 
-    def static_cam(name, loc, lens, target=rig):
-        cam = bpy.data.objects.new(name, bpy.data.cameras.new(name))
-        scene.collection.objects.link(cam)
-        cam.location = loc
+    def frames(t0, t1):
+        return range(max(int(t0 * FPS), 0), min(int(t1 * FPS) + 2, n))
+
+    def make_cam(name, lens, track=None, focus=None, fstop=2.8):
+        cam = link(bpy.data.objects.new(name, bpy.data.cameras.new(name)))
         cam.data.lens = lens
-        c = cam.constraints.new("TRACK_TO")
-        c.target = target
-        c.track_axis = "TRACK_NEGATIVE_Z"
-        c.up_axis = "UP_Y"
+        cam.data.sensor_width = 36
+        cam.data.clip_end = 3000
+        if track is not None:
+            c = cam.constraints.new("TRACK_TO")
+            c.target = track
+            c.track_axis = "TRACK_NEGATIVE_Z"
+            c.up_axis = "UP_Y"
+        if focus is not None:
+            cam.data.dof.use_dof = True
+            cam.data.dof.focus_object = focus
+            cam.data.dof.aperture_fstop = fstop
         return cam
 
-    hub_cam = static_cam("Cam_Hub", (6, -8, HUB_HEIGHT_M + 2.2), 35)
-    end = ROUTE_END
-    # frames the hovering drone, the tether and the drop target together
-    focus = bpy.data.objects.new("DropZone_Focus", None)
-    scene.collection.objects.link(focus)
+    def handheld(i, amount):
+        t = i / FPS
+        return Vector((noise.noise(Vector((t * 0.7, 3.1, 0.0))),
+                       noise.noise(Vector((5.3, t * 0.7, 0.0))),
+                       noise.noise(Vector((0.0, 9.7, t * 0.6))))) * amount
+
+    def bake(cam, rng, target_fn, smooth=1.0, shake=0.0):
+        p = None
+        for i in rng:
+            want = target_fn(i, states[i])
+            p = want if p is None else p.lerp(want, smooth)
+            cam.location = p + handheld(i, shake)
+            cam.keyframe_insert("location", frame=i + 1)
+
+    def fwd_side(st):
+        fwd = Vector((-math.sin(st["yaw"]), math.cos(st["yaw"]), 0))
+        side = Vector((math.cos(st["yaw"]), math.sin(st["yaw"]), 0))
+        return fwd, side
+
+    shots = []
+    pad = Vector((0, 0, HUB_HEIGHT_M))
+
+    # 1. slow dolly around the parked drone
+    cam = make_cam("Shot01_HeroPad", 50, rig, rig, 2.0)
+    t0, t1 = 0.0, 3.5
+
+    def hero(i, st):
+        u = smoothstep(i / FPS / t1)
+        a = math.radians(225 + 35 * u)
+        r = 7.5 - 2.5 * u
+        return pad + Vector((math.cos(a) * r, math.sin(a) * r, 0.9 - 0.2 * u))
+    bake(cam, frames(t0, t1), hero, shake=0.02)
+    shots.append((t0, cam))
+
+    # 2. low angle on the roof looking up as it lifts off
+    cam = make_cam("Shot02_Liftoff", 20, rig, rig, 4.0)
+    cam.location = pad + Vector((2.6, -3.2, 0.25))
+    for t, lens in ((3.5, 20), (5.0, 24), (8.0, 85)):  # zoom in as it climbs away
+        cam.data.lens = lens
+        cam.data.keyframe_insert("lens", frame=int(t * FPS) + 1)
+    shots.append((3.5, cam))
+
+    # 3. long-lens side tracking through the transition
+    cam = make_cam("Shot03_Transition", 70, rig, rig, 4.0)
+    bake(cam, frames(8.0, 14.0),
+         lambda i, st: st["pos"] + fwd_side(st)[1] * 16 - fwd_side(st)[0] * 4 + Vector((0, 0, -2)),
+         smooth=0.08, shake=0.05)
+    shots.append((8.0, cam))
+
+    # 4. chase
+    cam = make_cam("Shot04_Chase", 35, rig, rig, 5.6)
+    bake(cam, frames(14.0, 24.0),
+         lambda i, st: st["pos"] - fwd_side(st)[0] * 7 + fwd_side(st)[1] * 2.5 + Vector((0, 0, 2.2)),
+         smooth=0.12, shake=0.12)
+    shots.append((14.0, cam))
+
+    # 5. straight-down aerial, drone's nose to the top of frame
+    cam = make_cam("Shot05_Overhead", 50)
+    p = None
+    for i in frames(24.0, 31.0):
+        st = states[i]
+        want = st["pos"] + Vector((0, 0, 24))
+        p = want if p is None else p.lerp(want, 0.6)
+        cam.location = p
+        cam.rotation_euler = (0, 0, st["yaw"] + math.radians(8) * math.sin(i / FPS * 0.4))
+        cam.keyframe_insert("location", frame=i + 1)
+        cam.keyframe_insert("rotation_euler", frame=i + 1)
+    shots.append((24.0, cam))
+
+    # 6. waiting ahead of the drop zone as it arrives and flares to hover
+    cam = make_cam("Shot06_Arrival", 85, rig, rig, 4.0)
+    cam.location = Vector((end.x, end.y, 0)) + (end_tan * 16 + end_side * 7).to_3d() + Vector((0, 0, 48))
+    shots.append((31.0, cam))
+
+    # 7/9. ground cam at the drop zone, focus on the parcel
+    focus = link(bpy.data.objects.new("DropZone_Focus", None))
     focus.location = (end.x, end.y, HOVER_DROP_ALT_M * 0.55)
-    drop_cam = static_cam("Cam_DropZone", (end.x + 12, end.y - 16, 2.5), 18, focus)
+    ground = make_cam("Shot07_DropGround", 18, focus, parcel, 5.6)
+    ground.location = (end.x + 12, end.y - 16, 2.5)
+    shots.append((phases["descend"], ground))
 
-    # camera cuts via markers
-    def cut(cam, t):
-        m = scene.timeline_markers.new(f"cut_{cam.name}", frame=int(t * FPS) + 1)
-        m.camera = cam
+    # 8. close on the tether as the parcel goes down
+    cam = make_cam("Shot08_Tether", 40, parcel, parcel, 2.8)
+    bake(cam, frames(50.0, 54.2),
+         lambda i, st: st["pos"] + fwd_side(st)[1] * 3 - fwd_side(st)[0] * 1.5 + Vector((0, 0, 1.2)),
+         smooth=0.2, shake=0.03)
+    shots.append((50.0, cam))
+    shots.append((54.2, ground))
 
-    cut(hub_cam, 0)
-    cut(chase, phases["climb"] - 1.0)
-    cut(drop_cam, phases["back"] + 1.0)
-    cut(chase, phases["retract"])
-    scene.camera = hub_cam
+    # 10. wide departure, drone climbs out and away
+    cam = make_cam("Shot10_Depart", 40, rig, rig, 8.0)
+    cam.location = Vector((end.x, end.y, 0)) + (-end_tan * 14 - end_side * 9).to_3d() + Vector((0, 0, 4))
+    shots.append((phases["retract"], cam))
+
+    for t, c in shots:
+        m = scene.timeline_markers.new(f"cut_{c.name}", frame=int(t * FPS) + 1)
+        m.camera = c
+    scene.camera = shots[0][1]
 
 
 def setup_render(scene, out_path):
@@ -670,14 +775,26 @@ def setup_render(scene, out_path):
             break
         except TypeError:
             continue
-    scene.render.resolution_x = 1920
-    scene.render.resolution_y = 1080
+    scene.render.resolution_x, scene.render.resolution_y = ASPECT
     scene.render.use_motion_blur = True
+    scene.render.motion_blur_shutter = 0.5
     try:
         scene.view_settings.view_transform = "AgX"
     except TypeError:
         scene.view_settings.view_transform = "Filmic"
-    scene.view_settings.exposure = -0.5
+    for look in ("AgX - Punchy", "Punchy", "AgX - Medium High Contrast", "Medium High Contrast"):
+        try:
+            scene.view_settings.look = look
+            break
+        except TypeError:
+            continue
+    scene.view_settings.exposure = -0.2
+    for attr, val in (("use_raytracing", True), ("use_shadows", True),
+                      ("volumetric_tile_size", "8"), ("volumetric_end", 1500.0)):
+        try:
+            setattr(scene.eevee, attr, val)
+        except (AttributeError, TypeError):
+            pass
     if out_path:
         scene.render.filepath = out_path
         try:
@@ -697,7 +814,7 @@ def setup_render(scene, out_path):
 def main():
     opts = parse_cli()
     scene = reset_scene()
-    build_world(scene)
+    build_world(scene, haze=opts["engine"] != "CYCLES")
 
     pts, cum = make_route()
     build_city(pts)
@@ -716,6 +833,8 @@ def main():
           ", ".join(f"{k}={v:.1f}" for k, v in phases.items()))
     print(f"[airbound] route length {cum[-1]:.0f} m, {len(states)} frames @ {FPS} fps")
 
+    if opts["percent"]:
+        scene.render.resolution_percentage = int(opts["percent"])
     if opts["engine"]:
         scene.render.engine = opts["engine"]
         if opts["engine"] == "CYCLES":
@@ -726,8 +845,10 @@ def main():
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(opts["blend"]))
     if opts["stills"]:
         os.makedirs(opts["stills"], exist_ok=True)
-        for name, t in phases.items():
-            f = min(int(t * FPS) - FPS // 2, scene.frame_end)
+        cuts = sorted((m.frame, m.name) for m in scene.timeline_markers if m.camera)
+        for k, (start, name) in enumerate(cuts):
+            stop = cuts[k + 1][0] if k + 1 < len(cuts) else scene.frame_end
+            f = min((start + stop) // 2, scene.frame_end)
             scene.frame_set(max(f, 1))
             scene.render.image_settings.file_format = "PNG"
             scene.render.filepath = os.path.join(opts["stills"], f"{f:05d}_{name}.png")
